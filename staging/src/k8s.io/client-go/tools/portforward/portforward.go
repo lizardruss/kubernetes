@@ -22,6 +22,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -43,6 +44,8 @@ var (
 
 	// set of error we're expecting during port-forwarding
 	networkClosedError = "use of closed network connection"
+
+	networkClosedRe = regexp.MustCompile(`network namespace for sandbox "\w+" is closed|sandbox \w+ is not running`)
 )
 
 // PortForwarder knows how to listen for local connections and forward them to
@@ -422,7 +425,20 @@ func (pf *PortForwarder) handleConnection(conn net.Conn, port ForwardedPort) {
 	err = <-errorChan
 	if err != nil {
 		runtime.HandleError(err)
-		pf.streamConn.Close()
+		// don't tear down the whole parent port-forward pf.streamConn when there's
+		// an error handling a single request, container runtime should handle
+		// the streaming error by reseting the connection, so we should be able
+		// to keep the connection open until a user explicitly requests an end
+		if networkClosedRe.MatchString(err.Error()) {
+			// there are two cases when we consider closing the entire connection:
+			// 1. networkClosedRe is happening when a pod is removed, in which case we should stop
+			//    port forwarding, although we'll only know about it only during subsequent
+			//    connection attempts, where one of the io.Copy goroutines fails.
+			// 2. streamTimeoutRe is happening when we're dealing with an older CRI, which doesn't
+			//    reset the streams, and thus we only learn about the error when trying to create
+			//    a subsequent stream, which fails with that error.
+			_ = pf.streamConn.Close()
+		}
 	}
 }
 
